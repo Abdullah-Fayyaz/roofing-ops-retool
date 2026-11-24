@@ -1,0 +1,25 @@
+const assert = require('assert'), crypto = require('crypto');
+const { execFileSync } = require('child_process');
+const W = require('./blocks');
+let pass = 0; const t = async (n, f) => { await f(); pass++; console.log('  PASS ', n); };
+const good = { inspection_id: 'insp-9001', job_id: 12, completed_at: '2026-11-20T15:00:00Z', hail_hits: 11, wind_damage: false, notes: 'Front slope' };
+const psql = sql => execFileSync('psql', ['-h', '/tmp/pg', '-p', '5433', '-U', 'retool_workflow', '-d', 'roofing', '-At', '-c', sql]).toString().trim();
+(async () => {
+  await t('accepts a correctly signed body', () => { const raw = JSON.stringify(good); assert(W.verifySignature(raw, 'sha256=' + crypto.createHmac('sha256', 's3').update(raw).digest('hex'), 's3')); });
+  await t('rejects a tampered body', () => assert.throws(() => W.verifySignature('{"x":1}', 'sha256=' + 'a'.repeat(64), 's3'), /bad signature/));
+  await t('rejects a missing signature', () => assert.throws(() => W.verifySignature('{}', '', 's3'), /missing/));
+  await t('validate returns clean values', () => assert.deepStrictEqual(W.validate(good).jobId, 12));
+  await t('validate lists every problem at once', () => assert.throws(() => W.validate({ job_id: -1, completed_at: 'x', hail_hits: 999 }), e => e.code === 'VALIDATION' && e.message.split(';').length === 4));
+  await t('hail of 8+ suggests a claim, light hail does not', () => { assert(W.suggestsClaim(W.validate(good))); assert(!W.suggestsClaim(W.validate({ ...good, hail_hits: 2 }))); });
+  await t('retries a 503 then succeeds', async () => { let n = 0; const r = await W.withRetry(async () => { if (n++ < 2) { const e = new Error('down'); e.status = 503; throw e; } return 'ok'; }, { sleep: async () => {} }); assert.equal(r, 'ok'); assert.equal(n, 3); });
+  await t('does not retry a 400', async () => { let n = 0; await assert.rejects(W.withRetry(async () => { n++; const e = new Error('bad'); e.status = 400; throw e; }, { sleep: async () => {} })); assert.equal(n, 1); });
+  await t('retries 429, gives up after 4 tries', async () => { let n = 0; await assert.rejects(W.withRetry(async () => { n++; const e = new Error('slow'); e.status = 429; throw e; }, { sleep: async () => {} })); assert.equal(n, 4); });
+  await t('error report marks validation as a warning', () => { try { W.validate({}); } catch (e) { assert.equal(W.errorReport(e, {}).severity, 'warning'); } });
+  const v = W.validate({ ...good, inspection_id: 'insp-' + Date.now() });
+  const call = `select created, job_status from api.record_inspection('${v.externalId}', ${v.jobId}, '${v.inspectedAt}', ${v.hailHits}, ${v.wind}, 'test')`;
+  await t('SQL block: first delivery records the inspection', () => assert.match(psql(call), /^t\|/));
+  await t('SQL block: duplicate delivery is a no-op', () => assert.match(psql(call), /^f\|/));
+  await t('SQL block: unknown job fails loudly', () => assert.throws(() => execFileSync('psql', ['-h','/tmp/pg','-p','5433','-U','retool_workflow','-d','roofing','-v','ON_ERROR_STOP=1','-c', "select * from api.record_inspection('x-1', 999999, now(), 0, false, '')"], { stdio: 'pipe' }), /unknown job/));
+  await t('workflow role cannot read customers', () => assert.throws(() => execFileSync('psql', ['-h','/tmp/pg','-p','5433','-U','retool_workflow','-d','roofing','-v','ON_ERROR_STOP=1','-c','select * from core.customers limit 1'], { stdio: 'pipe' }), /permission denied/));
+  console.log(`\n${pass} passed`);
+})().catch(e => { console.error('FAIL', e.message); process.exit(1); });
